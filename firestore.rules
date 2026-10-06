@@ -1,0 +1,200 @@
+rules_version = '2';
+
+// Regras de segurança do Catanho.
+// Cole este conteúdo em: Console do Firebase > Firestore > aba "Regras" > Publicar.
+//
+// Todas as quantidades (catanhos e estoque) são números inteiros.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ================= Funções de apoio =================
+    function logado() {
+      return request.auth != null;
+    }
+    function caminhoPerfil() {
+      return /databases/$(database)/documents/usuarios/$(request.auth.uid);
+    }
+    function temPerfil() {
+      return logado() && exists(caminhoPerfil());
+    }
+    function meuPerfil() {
+      return get(caminhoPerfil()).data;
+    }
+    function ehAdmin() {
+      return temPerfil() && meuPerfil().perfil == 'admin';
+    }
+    function ehResponsavel() {
+      return temPerfil() && meuPerfil().perfil == 'responsavel';
+    }
+    function minhaModalidade() {
+      return meuPerfil().modalidadeId;
+    }
+    function horaValida(h) {
+      return h is string && h.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$');
+    }
+
+    // ================= Solicitação =================
+    // Uma solicitação só é aceita se:
+    // - for da modalidade do responsável e de um evento dessa modalidade;
+    // - tiver horário de retirada e quantidade de catanhos dentro do limite;
+    // - tiver de 1 a 6 itens, todos ativos; o consumo de cada item deve ser
+    //   exatamente a quantidade de catanhos pedida;
+    // - cada item tiver tido a baixa no estoque feita NO MESMO lote,
+    //   sem deixar o saldo negativo (ver regras de /itens).
+    function itemNaPosicao(solId, d, ks, i) {
+      return ks.size() <= i || itemDaSolicitacaoValido(solId, d, ks[i]);
+    }
+    function itemDaSolicitacaoValido(solId, d, k) {
+      let q = d.itens[k].quantidade;
+      let depois = getAfter(/databases/$(database)/documents/itens/$(k)).data;
+      return q is int
+        && q >= 1
+        && d.itens[k].keys().hasOnly(['nome', 'unidade', 'quantidade'])
+        && depois.ativo == true
+        && q == d.quantidade
+        && depois.ultimaBaixa == solId
+        && depois.saldo >= 0;
+    }
+    function solicitacaoValida(solId, d) {
+      let p = meuPerfil();
+      let limite = get(/databases/$(database)/documents/modalidades/$(p.modalidadeId)).data.limite;
+      let ev = get(/databases/$(database)/documents/eventos/$(d.eventoId)).data;
+      let ks = d.itens.keys();
+      return p.perfil == 'responsavel'
+        && d.keys().hasOnly(['modalidadeId', 'eventoId', 'horarioRetirada', 'quantidade', 'itens', 'usuarioId', 'usuarioNome', 'status', 'criadoEm'])
+        && d.keys().hasAll(['modalidadeId', 'eventoId', 'horarioRetirada', 'quantidade', 'itens', 'usuarioId', 'usuarioNome', 'status', 'criadoEm'])
+        && d.modalidadeId == p.modalidadeId
+        && d.usuarioId == request.auth.uid
+        && d.usuarioNome == p.nome
+        && d.status == 'pendente'
+        && d.criadoEm == request.time
+        && horaValida(d.horarioRetirada)
+        && ev.modalidadeId == p.modalidadeId
+        && d.quantidade is int
+        && d.quantidade >= 1
+        && limite is int
+        && d.quantidade <= limite
+        && d.itens is map
+        && ks.size() >= 1
+        && ks.size() <= 6
+        && itemNaPosicao(solId, d, ks, 0)
+        && itemNaPosicao(solId, d, ks, 1)
+        && itemNaPosicao(solId, d, ks, 2)
+        && itemNaPosicao(solId, d, ks, 3)
+        && itemNaPosicao(solId, d, ks, 4)
+        && itemNaPosicao(solId, d, ks, 5);
+    }
+
+    // ================= Estoque =================
+    // Baixa feita pelo responsável: só pode mexer em saldo/saídas, só no
+    // mesmo lote em que a solicitação é criada (criadoEm == agora), e a baixa
+    // tem de ser exatamente a quantidade pedida. Repetir a mesma solicitação
+    // é impossível: o documento já existiria e não pode ser recriado.
+    function baixaPorSolicitacao(itemId) {
+      let novo = request.resource.data;
+      let ant = resource.data;
+      return logado()
+        && novo.diff(ant).affectedKeys().hasOnly(['saldo', 'saidas', 'ultimaBaixa'])
+        && novo.ultimaBaixa is string
+        && novo.ultimaBaixa != ant.ultimaBaixa
+        && confereSolicitacao(itemId, novo, ant);
+    }
+    function confereSolicitacao(itemId, novo, ant) {
+      let sol = getAfter(/databases/$(database)/documents/solicitacoes/$(novo.ultimaBaixa)).data;
+      let q = sol.itens[itemId].quantidade;
+      return sol.criadoEm == request.time
+        && sol.usuarioId == request.auth.uid
+        && q is int
+        && novo.saldo == ant.saldo - q
+        && novo.saidas == ant.saidas + q
+        && novo.saldo >= 0;
+    }
+    function camposItem() {
+      return ['nome', 'unidade', 'ativo', 'estoqueInicial', 'entradas', 'saidas', 'saldo', 'ultimaBaixa'];
+    }
+    function itemBasicoValido(d) {
+      return d.keys().hasOnly(camposItem())
+        && d.keys().hasAll(camposItem())
+        && d.nome is string && d.nome.size() > 0
+        && d.unidade is string && d.unidade.size() > 0
+        && d.ativo is bool
+        && d.estoqueInicial is int && d.estoqueInicial >= 0
+        && d.entradas is int
+        && d.saidas is int
+        && d.saldo == d.estoqueInicial + d.entradas - d.saidas
+        && d.saldo >= 0;
+    }
+    function itemNovoValido(d) {
+      return itemBasicoValido(d) && d.entradas == 0 && d.saidas == 0 && d.ultimaBaixa == '';
+    }
+    function itemAlteradoPeloAdmin(n, a) {
+      return itemBasicoValido(n)
+        && n.entradas >= a.entradas
+        && n.saidas == a.saidas
+        && n.ultimaBaixa == a.ultimaBaixa;
+    }
+
+    // ================= Coleções =================
+
+    // Perfis: cada pessoa lê o próprio; o Administrador lê todos.
+    // Administradores só são criados pelo Console do Firebase.
+    match /usuarios/{uid} {
+      allow read: if ehAdmin() || (logado() && request.auth.uid == uid);
+      allow create: if ehAdmin() && request.resource.data.perfil == 'responsavel';
+      allow update: if ehAdmin() && request.resource.data.perfil == resource.data.perfil;
+      allow delete: if false;
+    }
+
+    // Modalidades (inclui o limite de catanhos).
+    match /modalidades/{id} {
+      allow read: if ehAdmin() || (ehResponsavel() && minhaModalidade() == id);
+      allow write: if ehAdmin();
+    }
+
+    // Eventos: cada evento pertence a uma modalidade.
+    match /eventos/{id} {
+      allow read: if ehAdmin() || (ehResponsavel() && resource.data.modalidadeId == minhaModalidade());
+      allow create, update: if ehAdmin() && request.resource.data.modalidadeId is string;
+      allow delete: if false;
+    }
+
+    // Itens e estoque. O responsável lê o catálogo, mas só altera o saldo
+    // através de uma solicitação válida.
+    match /itens/{itemId} {
+      allow read: if temPerfil();
+      allow create: if ehAdmin() && itemNovoValido(request.resource.data);
+      allow update: if baixaPorSolicitacao(itemId)
+        || (ehAdmin() && itemAlteradoPeloAdmin(request.resource.data, resource.data));
+      allow delete: if false;
+    }
+
+    // Movimentações de estoque feitas pelo Administrador (estoque inicial e entradas).
+    // As saídas ficam registradas nas próprias solicitações.
+    match /movimentos/{id} {
+      allow read: if ehAdmin();
+      allow create: if ehAdmin()
+        && request.resource.data.keys().hasOnly(['itemId', 'itemNome', 'tipo', 'quantidade', 'criadoEm', 'porUid', 'porNome'])
+        && request.resource.data.tipo in ['inicial', 'entrada']
+        && request.resource.data.quantidade is int
+        && request.resource.data.quantidade >= 0
+        && request.resource.data.criadoEm == request.time
+        && request.resource.data.porUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Solicitações.
+    match /solicitacoes/{solId} {
+      allow read: if ehAdmin() || (ehResponsavel() && resource.data.modalidadeId == minhaModalidade());
+      allow create: if logado() && solicitacaoValida(solId, request.resource.data);
+      // Único ajuste permitido: o Administrador marcar como Atendido (sem mexer no estoque).
+      allow update: if ehAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'atendidoEm', 'atendidoPorUid', 'atendidoPorNome'])
+        && resource.data.get('status', 'pendente') == 'pendente'
+        && request.resource.data.status == 'atendido'
+        && request.resource.data.atendidoEm == request.time
+        && request.resource.data.atendidoPorUid == request.auth.uid
+        && request.resource.data.atendidoPorNome == meuPerfil().nome;
+      allow delete: if false;
+    }
+  }
+}
