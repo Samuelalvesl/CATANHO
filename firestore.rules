@@ -36,6 +36,7 @@ service cloud.firestore {
     // ================= Solicitação =================
     // Uma solicitação só é aceita se:
     // - for da modalidade do responsável e de um evento dessa modalidade;
+    // - for a única solicitação da modalidade para o evento (id "modalidade_evento");
     // - tiver horário de retirada e quantidade de catanhos dentro do limite;
     // - tiver de 1 a 6 itens, todos ativos; o consumo de cada item deve ser
     //   exatamente a quantidade de catanhos pedida;
@@ -64,6 +65,7 @@ service cloud.firestore {
         && d.keys().hasOnly(['modalidadeId', 'eventoId', 'horarioRetirada', 'quantidade', 'itens', 'usuarioId', 'usuarioNome', 'status', 'criadoEm'])
         && d.keys().hasAll(['modalidadeId', 'eventoId', 'horarioRetirada', 'quantidade', 'itens', 'usuarioId', 'usuarioNome', 'status', 'criadoEm'])
         && d.modalidadeId == p.modalidadeId
+        && solId == p.modalidadeId + '_' + d.eventoId
         && d.usuarioId == request.auth.uid
         && d.usuarioNome == p.nome
         && d.status == 'pendente'
@@ -184,7 +186,11 @@ service cloud.firestore {
 
     // Solicitações.
     match /solicitacoes/{solId} {
-      allow read: if ehAdmin() || (ehResponsavel() && resource.data.modalidadeId == minhaModalidade());
+      // "resource == null" permite ao responsável verificar se já pediu para um evento
+      // (consulta a um documento que ainda não existe; nada é revelado).
+      allow read: if ehAdmin() || (ehResponsavel() && (resource == null || resource.data.modalidadeId == minhaModalidade()));
+      // Uma solicitação por evento: o identificador é "modalidade_evento" e um
+      // documento existente nunca pode ser recriado pelo responsável.
       allow create: if logado() && solicitacaoValida(solId, request.resource.data);
       // Único ajuste permitido: o Administrador marcar como Atendido (sem mexer no estoque).
       allow update: if ehAdmin()
