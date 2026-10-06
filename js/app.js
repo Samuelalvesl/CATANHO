@@ -291,6 +291,8 @@
 
   function formularioSolicitacao(mod, valores = {}) {
     const eventos = eventosOrdenados();
+    const jaPedido = id => dados.solicitacoes.some(s => s.eventoId === id);
+    const livres = eventos.filter(ev => !jaPedido(ev.id));
     const disponiveis = itensOrdenados().filter(i => i.ativo);
     const marcado = id => (valores.itemIds || []).includes(id);
 
@@ -300,10 +302,13 @@
         <label>Modalidade<input value="${esc(mod.nome)}" readonly></label>
         <label>Evento
           <select id="selEvento">
-            <option value="">${eventos.length ? 'Selecione o evento' : 'Nenhum evento cadastrado para sua modalidade'}</option>
-            ${eventos.map(ev => `<option value="${ev.id}" ${ev.id === valores.eventoId ? 'selected' : ''}>${esc(nomeEvento(ev))}</option>`).join('')}
+            <option value="">${!eventos.length ? 'Nenhum evento cadastrado para sua modalidade' : livres.length ? 'Selecione o evento' : 'Todos os eventos já possuem solicitação'}</option>
+            ${eventos.map(ev => jaPedido(ev.id)
+              ? `<option value="${ev.id}" disabled>${esc(nomeEvento(ev))} — já solicitado</option>`
+              : `<option value="${ev.id}" ${ev.id === valores.eventoId ? 'selected' : ''}>${esc(nomeEvento(ev))}</option>`).join('')}
           </select>
         </label>
+        <p class="muted small" style="margin-top:-.5rem">É permitida apenas uma solicitação por evento.</p>
         <label>Horário de retirada do catanho
           <input type="time" id="inpHora" value="${esc(valores.horario)}">
         </label>
@@ -339,6 +344,7 @@
       const horario = $('inpHora').value;
       const quantidade = paraInteiro($('inpQtd').value);
       if (!eventoId) return erro('Selecione o evento.');
+      if (jaPedido(eventoId)) return erro('Já existe uma solicitação da sua modalidade para este evento. É permitida apenas uma solicitação por evento.');
       if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(horario)) return erro('Informe o horário de retirada do catanho.');
       if (quantidade == null || Number.isNaN(quantidade) || quantidade < 1) return erro('Informe uma quantidade de catanhos válida (número inteiro maior que zero).');
 
@@ -352,9 +358,11 @@
   }
 
   function resumoSolicitacao(mod, d) {
-    // O identificador é gerado uma única vez: se a confirmação for repetida,
-    // o Firestore recusa a segunda gravação e o estoque não é baixado duas vezes.
-    const solRef = doc(collection(db, 'solicitacoes'));
+    // Identificador fixo "modalidade_evento": só pode existir uma solicitação por
+    // evento para cada modalidade. Uma segunda gravação (ou uma confirmação repetida)
+    // é recusada pelo Firestore, e o estoque não é baixado duas vezes.
+    const solRef = doc(db, 'solicitacoes', `${mod.id}_${d.eventoId}`);
+    const MSG_DUPLICADA = 'Já existe uma solicitação da sua modalidade para este evento. É permitida apenas uma solicitação por evento.';
     $('secSolicitacao').innerHTML = `
       <h2>Resumo da solicitação</h2>
       <p class="muted">Confira os dados antes de confirmar.</p>
@@ -373,6 +381,9 @@
     $('btnVoltar').onclick = () => formularioSolicitacao(mod, d);
     $('btnConfirmar').onclick = () => comBotao($('btnConfirmar'), async () => {
       const erro = msg => { $('erroConf').textContent = msg; };
+      try {
+        if ((await getDoc(solRef)).exists()) return erro(MSG_DUPLICADA);
+      } catch (e) { return erro(msgErro(e)); }
       try {
         // Confere limite e estoque com os dados mais recentes.
         const [mSnap, ...snaps] = await Promise.all([
@@ -407,7 +418,8 @@
         await lote.commit();
         telaResponsavel('Solicitação registrada com sucesso.');
       } catch (e) {
-        // Se a gravação chegou ao servidor mas a resposta se perdeu, não repete.
+        // A solicitação não existia antes desta confirmação: se agora existe,
+        // a gravação chegou ao servidor e só a resposta se perdeu.
         try {
           const ja = await getDoc(solRef);
           if (ja.exists()) return telaResponsavel('Solicitação registrada com sucesso.');
