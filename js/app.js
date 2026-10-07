@@ -67,6 +67,10 @@
   let mensagemLogin = '';
   let dados = vazio();
   let filtroSolicitacoes = 'todas';
+  // Quem está usando o painel de solicitações (Administrador ou Catanheiro).
+  const CTX_ADMIN = { papel: 'admin', recarregar: msg => telaAdmin('solicitacoes', msg, true) };
+  const CTX_CATANHEIRO = { papel: 'catanheiro', recarregar: msg => telaCatanheiro(msg) };
+  let ctxSol = CTX_ADMIN;
 
   function vazio() {
     return { modalidades: [], eventos: [], usuarios: [], solicitacoes: [], itens: [], movimentos: [] };
@@ -184,7 +188,8 @@
       const s = await getDoc(doc(db, 'usuarios', user.uid));
       if (!s.exists()) return sair('Seu acesso ainda não foi configurado. Procure o Administrador.');
       perfil = { uid: user.uid, ...s.data() };
-      if (perfil.perfil === 'admin') return telaAdmin('solicitacoes', '', true);
+      if (perfil.perfil === 'admin') { filtroSolicitacoes = 'todas'; ctxSol = CTX_ADMIN; return telaAdmin('solicitacoes', '', true); }
+      if (perfil.perfil === 'catanheiro') { filtroSolicitacoes = 'recebidos'; ctxSol = CTX_CATANHEIRO; return telaCatanheiro(); }
       if (perfil.perfil === 'responsavel' && perfil.modalidadeId) return telaResponsavel();
       return sair('Usuário sem modalidade vinculada. Procure o Administrador.');
     } catch (e) {
@@ -451,6 +456,7 @@
     ['itens', 'Itens e estoque'],
     ['modalidades', 'Modalidades e limites'],
     ['responsaveis', 'Responsáveis'],
+    ['catanheiros', 'Catanheiros'],
     ['eventos', 'Eventos']
   ];
 
@@ -490,6 +496,44 @@
   }
   const salvo = (aba, msg) => telaAdmin(aba, msg, true);
 
+  // Cria o login (Firebase Authentication) em uma instância separada,
+  // para não desconectar o Administrador. Devolve o UID do novo usuário.
+  async function criarAcesso(email, senha) {
+    const appCadastro = initializeApp(cfg, 'cadastro-' + Date.now());
+    try {
+      const authCadastro = initializeAuth(appCadastro, { persistence: inMemoryPersistence });
+      const cred = await createUserWithEmailAndPassword(authCadastro, email, senha);
+      await signOut(authCadastro);
+      return cred.user.uid;
+    } finally {
+      await deleteApp(appCadastro);
+    }
+  }
+
+  /* ================= Catanheiro ================= */
+  // Vê apenas solicitações autorizadas ("Pedido Recebido") e as já fornecidas,
+  // e só pode marcar "Fornecido" (com baixa no estoque).
+  async function telaCatanheiro(mensagem) {
+    app.innerHTML = CARREGANDO;
+    try {
+      const [modalidades, eventos, solicitacoes] = await Promise.all([
+        lista('modalidades'), lista('eventos'),
+        listaConsulta(query(collection(db, 'solicitacoes'), where('status', 'in', ['recebido', 'fornecido'])))
+      ]);
+      dados = { ...vazio(), modalidades: ordenarModalidades(modalidades), eventos, solicitacoes };
+    } catch (e) {
+      return telaFalha('Catanheiro', e, () => telaCatanheiro());
+    }
+    app.innerHTML = cabecalho('Catanheiro', true) + `
+      <main class="conteudo">
+        ${mensagem ? `<div class="aviso">${esc(mensagem)}</div>` : ''}
+        <div id="painel"></div>
+      </main>`;
+    ligarSair();
+    $('btnAtualizar').onclick = () => telaCatanheiro();
+    PAINEIS.solicitacoes($('painel'));
+  }
+
   const botaoSalvar = (ed, id) => `<button class="btn primario" type="submit" id="${id}">${ed ? 'Salvar alterações' : 'Cadastrar'}</button>`;
   const botaoCancelar = ed => ed ? '<button class="btn secundario" type="button" id="btnCancelar">Cancelar edição</button>' : '';
 
@@ -505,9 +549,10 @@
         <div class="rotulo">${rotulo}</div><div class="valor">${fmtQtd(soma(l))}</div>
         <div class="small ${destaque ? '' : 'muted'}" ${destaque ? 'style="color:var(--azul-200)"' : ''}>${plural(l.length, 'solicitação', 'solicitações')}</div></div>`;
 
+      const catanheiro = ctxSol.papel === 'catanheiro';
       const acoes = s => {
         const st = statusDe(s);
-        if (st === 'pendente')
+        if (st === 'pendente' && !catanheiro)
           return `<div style="margin-top:.35rem"><button class="btn primario pequeno" data-receber="${s.id}">Pedido Recebido</button></div>`;
         if (st === 'recebido')
           return `<div style="margin-top:.35rem"><button class="btn primario pequeno" data-fornecer="${s.id}">✓ Fornecido</button></div>`;
@@ -518,16 +563,19 @@
 
       p.innerHTML = `
       <div class="indicadores">
-        ${indicador('Catanhos pendentes', pend, true)}
-        ${indicador('Pedidos recebidos', rec)}
-        ${indicador('Catanhos fornecidos', forn)}
-        ${indicador('Total de catanhos', todas)}
+        ${catanheiro
+          ? indicador('Catanhos a fornecer', rec, true) + indicador('Catanhos fornecidos', forn)
+          : indicador('Catanhos pendentes', pend, true) + indicador('Pedidos recebidos', rec) + indicador('Catanhos fornecidos', forn) + indicador('Total de catanhos', todas)}
       </div>
       <section class="card">
-        <h2>Solicitações</h2>
-        <p class="muted small" style="margin-top:-.3rem">Fluxo: Pendente → Pedido Recebido → Fornecido. A baixa no estoque ocorre somente no "Fornecido".</p>
+        <h2>${catanheiro ? 'Solicitações autorizadas' : 'Solicitações'}</h2>
+        <p class="muted small" style="margin-top:-.3rem">${catanheiro
+          ? 'Aqui aparecem as solicitações autorizadas pelo Administrador ("Pedido Recebido"). Ao entregar o catanho, clique em "Fornecido": a baixa no estoque é feita nesse momento.'
+          : 'Fluxo: Pendente → Pedido Recebido → Fornecido. A baixa no estoque ocorre somente no "Fornecido".'}</p>
         <div class="filtros">
-          ${[['todas', 'Todas'], ['pendentes', 'Pendentes'], ['recebidos', 'Pedido Recebido'], ['fornecidos', 'Fornecidos']].map(([k, t]) =>
+          ${(catanheiro
+            ? [['recebidos', 'A fornecer'], ['fornecidos', 'Fornecidos'], ['todas', 'Todas']]
+            : [['todas', 'Todas'], ['pendentes', 'Pendentes'], ['recebidos', 'Pedido Recebido'], ['fornecidos', 'Fornecidos']]).map(([k, t]) =>
             `<button data-filtro="${k}" class="${filtroSolicitacoes === k ? 'ativo' : ''}">${t}</button>`).join('')}
         </div>
         <div class="erro" id="erroAtend"></div>
@@ -566,7 +614,7 @@
               recebidoPorUid: perfil.uid,
               recebidoPorNome: perfil.nome
             });
-            salvo('solicitacoes', 'Solicitação marcada como Pedido Recebido.');
+            ctxSol.recarregar('Solicitação marcada como Pedido Recebido.');
           } catch (err) {
             erro(err.code === 'permission-denied'
               ? 'Não foi possível marcar como Pedido Recebido: o status desta solicitação já foi alterado. Clique em Atualizar.'
@@ -592,7 +640,7 @@
             // Confere o status atual no servidor (evita baixa duplicada após atualização da página).
             const atualSnap = await getDoc(solRef);
             const atual = { id: atualSnap.id, ...atualSnap.data() };
-            if (statusDe(atual) === 'fornecido') return salvo('solicitacoes', 'Esta solicitação já estava marcada como Fornecido. Nenhuma nova baixa foi feita.');
+            if (statusDe(atual) === 'fornecido') return ctxSol.recarregar('Esta solicitação já estava marcada como Fornecido. Nenhuma nova baixa foi feita.');
             if (statusDe(atual) !== 'recebido') return erro('Esta solicitação precisa estar como "Pedido Recebido" antes de ser marcada como Fornecido.');
 
             const lote = writeBatch(db);
@@ -621,7 +669,7 @@
               }));
             }
             await lote.commit();
-            salvo('solicitacoes', baixaNoFornecimento(atual)
+            ctxSol.recarregar(baixaNoFornecimento(atual)
               ? 'Solicitação marcada como Fornecido e baixa realizada no estoque.'
               : 'Solicitação marcada como Fornecido.');
           } catch (err) {
@@ -629,7 +677,7 @@
             try {
               const depois = await getDoc(solRef);
               if (depois.exists() && depois.data().status === 'fornecido')
-                return salvo('solicitacoes', 'Solicitação marcada como Fornecido.');
+                return ctxSol.recarregar('Solicitação marcada como Fornecido.');
             } catch (_) { /* sem acesso ou sem conexão */ }
             erro(err.code === 'permission-denied'
               ? 'Não foi possível marcar como Fornecido: o estoque ou o status foi alterado. Clique em Atualizar e tente novamente.'
@@ -838,6 +886,79 @@
       };
     },
 
+    /* ---- Catanheiros ---- */
+    catanheiros(p, editId) {
+      const lst = dados.usuarios.filter(u => u.perfil === 'catanheiro').sort((a, b) => a.nome.localeCompare(b.nome));
+      const ed = editId ? dados.usuarios.find(u => u.id === editId) : null;
+      p.innerHTML = `
+      <section class="card">
+        <h2>${ed ? 'Editar catanheiro' : 'Cadastrar catanheiro'}</h2>
+        <p class="muted small" style="margin-top:-.3rem">O catanheiro vê apenas as solicitações autorizadas ("Pedido Recebido") e só pode marcá-las como "Fornecido". Não acessa itens, estoque, limites, eventos nem cadastros.</p>
+        <form id="fCat" novalidate>
+          <div class="grade">
+            <label>Nome<input name="nome" value="${esc(ed?.nome)}"></label>
+            <label>Usuário/e-mail<input type="email" name="email" value="${esc(ed?.email)}" autocomplete="off" ${ed ? 'readonly' : ''}></label>
+            ${ed ? '' : '<label>Senha inicial<input type="password" name="senha" autocomplete="new-password" placeholder="Mínimo de 6 caracteres"></label>'}
+          </div>
+          ${ed ? '<p class="muted small" style="margin-top:-.4rem">O e-mail de acesso não pode ser alterado. Para trocar a senha, envie o e-mail de redefinição.</p>' : ''}
+          <div class="erro" id="erroCat"></div>
+          <div class="acoes">
+            ${botaoSalvar(ed, 'btnCat')}
+            ${ed ? '<button class="btn secundario" type="button" id="btnRedefinir">Enviar e-mail de redefinição de senha</button>' : ''}
+            ${botaoCancelar(ed)}
+          </div>
+        </form>
+      </section>
+      <section class="card">
+        <h2>Catanheiros cadastrados</h2>
+        ${lst.length ? `<div class="tabela-wrap"><table>
+          <thead><tr><th>Nome</th><th>Usuário/e-mail</th><th></th></tr></thead>
+          <tbody>${lst.map(u => `<tr>
+            <td>${esc(u.nome)}</td><td>${esc(u.email)}</td>
+            <td class="num"><button class="btn secundario pequeno" data-edit="${u.id}">Editar</button></td>
+          </tr>`).join('')}</tbody></table></div>` : '<p class="muted">Nenhum catanheiro cadastrado.</p>'}
+      </section>`;
+
+      p.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => PAINEIS.catanheiros(p, b.dataset.edit));
+      const erro = msg => { $('erroCat').textContent = msg; };
+      if (ed) {
+        $('btnCancelar').onclick = () => PAINEIS.catanheiros(p);
+        $('btnRedefinir').onclick = () => comBotao($('btnRedefinir'), async () => {
+          try {
+            await sendPasswordResetEmail(auth, ed.email);
+            erro('');
+            p.insertAdjacentHTML('afterbegin', `<div class="aviso">E-mail de redefinição enviado para ${esc(ed.email)}.</div>`);
+          } catch (err) { erro(msgErro(err)); }
+        });
+      }
+
+      $('fCat').onsubmit = e => {
+        e.preventDefault();
+        const f = new FormData(e.target);
+        const nome = String(f.get('nome')).trim();
+        const email = ed ? ed.email : String(f.get('email')).trim();
+        const senha = ed ? '' : String(f.get('senha'));
+        if (!nome) return erro('Informe o nome.');
+        if (!ed && !/^\S+@\S+\.\S+$/.test(email)) return erro('Informe um e-mail válido.');
+        if (!ed && senha.length < 6) return erro('A senha inicial deve ter pelo menos 6 caracteres.');
+        comBotao($('btnCat'), async () => {
+          try {
+            if (ed) {
+              await updateDoc(doc(db, 'usuarios', ed.id), { nome });
+              return salvo('catanheiros', 'Catanheiro atualizado.');
+            }
+            const uid = await criarAcesso(email, senha);
+            try {
+              await setDoc(doc(db, 'usuarios', uid), { nome, email, perfil: 'catanheiro' });
+            } catch (err) {
+              return erro('O acesso foi criado, mas o perfil não foi salvo (' + msgErro(err) + ').');
+            }
+            salvo('catanheiros', 'Catanheiro cadastrado.');
+          } catch (err) { erro(msgErro(err)); }
+        });
+      };
+    },
+
     /* ---- Responsáveis ---- */
     responsaveis(p, editId) {
       const resp = dados.usuarios.filter(u => u.perfil === 'responsavel').sort((a, b) => a.nome.localeCompare(b.nome));
@@ -910,17 +1031,7 @@
               await updateDoc(doc(db, 'usuarios', ed.id), { nome, modalidadeId: modId });
               return salvo('responsaveis', 'Responsável atualizado.');
             }
-            // Cria o acesso em uma instância separada para não desconectar o Administrador.
-            const appCadastro = initializeApp(cfg, 'cadastro-' + Date.now());
-            let uid;
-            try {
-              const authCadastro = initializeAuth(appCadastro, { persistence: inMemoryPersistence });
-              const cred = await createUserWithEmailAndPassword(authCadastro, email, senha);
-              uid = cred.user.uid;
-              await signOut(authCadastro);
-            } finally {
-              await deleteApp(appCadastro);
-            }
+            const uid = await criarAcesso(email, senha);
             try {
               await setDoc(doc(db, 'usuarios', uid), { nome, email, perfil: 'responsavel', modalidadeId: modId });
             } catch (err) {
