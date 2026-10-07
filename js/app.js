@@ -133,7 +133,15 @@
   const modalidade = id => dados.modalidades.find(m => m.id === id);
   const evento = id => dados.eventos.find(e => e.id === id);
   const item = id => dados.itens.find(i => i.id === id);
-  const statusDe = s => s.status === 'atendido' ? 'atendido' : 'pendente';
+  // Fluxo: pendente -> recebido ("Pedido Recebido") -> fornecido ("Fornecido" + baixa no estoque).
+  // "atendido" existe apenas em solicitações antigas (anteriores a este fluxo).
+  const statusDe = s => ['recebido', 'fornecido', 'atendido'].includes(s.status) ? s.status : 'pendente';
+  const grupoDe = s => ({ pendente: 'pendentes', recebido: 'recebidos', fornecido: 'fornecidos', atendido: 'fornecidos' })[statusDe(s)];
+  const classeLinha = s => ({ pendente: 'linha-pendente', recebido: 'linha-recebida', fornecido: 'linha-atendida', atendido: 'linha-atendida' })[statusDe(s)];
+  // Solicitações novas baixam o estoque no "Fornecido"; as antigas já baixaram ao serem criadas.
+  const baixaNoFornecimento = s => s.baixaNoFornecimento === true;
+  const estoqueBaixado = s => baixaNoFornecimento(s) ? statusDe(s) === 'fornecido' : true;
+  const dataDaBaixa = s => baixaNoFornecimento(s) ? s.fornecidoEm : s.criadoEm;
 
   const nomeEvento = ev => ev ? `${ev.nome} (${fmtData(ev.data)})` : '—';
   const eventosOrdenados = () => dados.eventos.slice().sort((a, b) => (a.data || '').localeCompare(b.data || '') || a.nome.localeCompare(b.nome));
@@ -147,9 +155,19 @@
     return `<ul class="lista-itens">${l.map(i => `<li>${esc(i.nome)}: <strong>${esc(qtdUn(i.quantidade, i.unidade))}</strong></li>`).join('')}</ul>`;
   }
   function seloStatus(s) {
-    return statusDe(s) === 'atendido'
-      ? '<span class="status atendido">✓ Atendido</span>'
-      : '<span class="status pendente">● Pendente</span>';
+    return {
+      pendente: '<span class="status pendente">● Pendente</span>',
+      recebido: '<span class="status recebido">◐ Pedido Recebido</span>',
+      fornecido: '<span class="status atendido">✓ Fornecido</span>',
+      atendido: '<span class="status atendido">✓ Atendido</span>'
+    }[statusDe(s)];
+  }
+  function historicoStatus(s) {
+    const linhas = [];
+    if (s.recebidoEm) linhas.push(`Recebido: ${fmtDataHora(s.recebidoEm)} por ${esc(s.recebidoPorNome || '—')}`);
+    if (s.fornecidoEm) linhas.push(`Fornecido: ${fmtDataHora(s.fornecidoEm)} por ${esc(s.fornecidoPorNome || '—')}`);
+    if (s.atendidoEm) linhas.push(`Atendido: ${fmtDataHora(s.atendidoEm)} por ${esc(s.atendidoPorNome || '—')}`);
+    return linhas.length ? `<div class="atendimento">${linhas.join('<br>')}</div>` : '';
   }
 
   async function sair(mensagem) {
@@ -251,7 +269,7 @@
         <h2>Solicitações da modalidade</h2>
         ${minhas.length ? `<div class="tabela-wrap"><table>
           <thead><tr><th>Registrada em</th><th>Evento</th><th>Retirada</th><th class="num">Catanhos</th><th>Itens</th><th>Status</th></tr></thead>
-          <tbody>${minhas.map(s => `<tr class="${statusDe(s) === 'atendido' ? 'linha-atendida' : 'linha-pendente'}">
+          <tbody>${minhas.map(s => `<tr class="${classeLinha(s)}">
             <td>${fmtDataHora(s.criadoEm)}</td>
             <td>${esc(nomeEvento(evento(s.eventoId)))}</td>
             <td>${esc(s.horarioRetirada || '—')}</td>
@@ -272,7 +290,8 @@
   }
 
   // Validação usada no formulário e novamente antes de gravar (com dados atualizados).
-  // Cada item marcado é descontado na mesma quantidade de catanhos solicitada.
+  // Cada item marcado recebe a mesma quantidade de catanhos solicitada.
+  // A baixa no estoque só ocorre quando o Administrador marca o pedido como "Fornecido".
   function validarSolicitacao(mod, d, catalogo) {
     const erros = [], itens = [];
     if (mod.limite == null || d.quantidade > mod.limite) erros.push(msgLimiteModalidade(mod));
@@ -321,7 +340,7 @@
 
         <h3 style="font-size:1rem;margin-top:1rem">Itens do catanho</h3>
         ${disponiveis.length ? `
-        <p class="muted small" style="margin-top:-.3rem">Marque os itens que vão compor o catanho (até ${MAX_ITENS_POR_SOLICITACAO} itens). Cada item marcado é descontado na mesma quantidade de catanhos solicitada.</p>
+        <p class="muted small" style="margin-top:-.3rem">Marque os itens que vão compor o catanho (até ${MAX_ITENS_POR_SOLICITACAO} itens). Cada item marcado terá a mesma quantidade de catanhos solicitada.</p>
         <div class="tabela-wrap itens-sol"><table>
           <thead><tr><th style="width:2.5rem"></th><th>Item</th><th>Unidade</th></tr></thead>
           <tbody>${disponiveis.map(i => {
@@ -398,8 +417,8 @@
         const itensMap = {};
         itens.forEach(i => { itensMap[i.id] = { nome: i.nome, unidade: i.unidade, quantidade: i.quantidade }; });
 
-        const lote = writeBatch(db);
-        lote.set(solRef, {
+        // O pedido não mexe no estoque: a baixa é feita no "Fornecido".
+        await setDoc(solRef, {
           modalidadeId: mod.id,
           eventoId: d.eventoId,
           horarioRetirada: d.horario,
@@ -408,14 +427,9 @@
           usuarioId: perfil.uid,
           usuarioNome: perfil.nome,
           status: 'pendente',
+          baixaNoFornecimento: true,
           criadoEm: serverTimestamp()
         });
-        itens.forEach(i => lote.update(doc(db, 'itens', i.id), {
-          saldo: increment(-i.quantidade),
-          saidas: increment(i.quantidade),
-          ultimaBaixa: solRef.id
-        }));
-        await lote.commit();
         telaResponsavel('Solicitação registrada com sucesso.');
       } catch (e) {
         // A solicitação não existia antes desta confirmação: se agora existe,
@@ -483,29 +497,43 @@
     /* ---- Solicitações ---- */
     solicitacoes(p) {
       const todas = dados.solicitacoes.slice().sort((a, b) => ms(b.criadoEm) - ms(a.criadoEm));
-      const pend = todas.filter(s => statusDe(s) === 'pendente');
-      const atend = todas.filter(s => statusDe(s) === 'atendido');
+      const grupo = g => todas.filter(s => grupoDe(s) === g);
+      const pend = grupo('pendentes'), rec = grupo('recebidos'), forn = grupo('fornecidos');
       const soma = l => l.reduce((t, s) => t + (s.quantidade || 0), 0);
-      const visiveis = filtroSolicitacoes === 'pendentes' ? pend : filtroSolicitacoes === 'atendidas' ? atend : todas;
+      const visiveis = filtroSolicitacoes === 'todas' ? todas : grupo(filtroSolicitacoes);
+      const indicador = (rotulo, l, destaque) => `<div class="indicador ${destaque ? 'destaque' : ''}">
+        <div class="rotulo">${rotulo}</div><div class="valor">${fmtQtd(soma(l))}</div>
+        <div class="small ${destaque ? '' : 'muted'}" ${destaque ? 'style="color:var(--azul-200)"' : ''}>${plural(l.length, 'solicitação', 'solicitações')}</div></div>`;
+
+      const acoes = s => {
+        const st = statusDe(s);
+        if (st === 'pendente')
+          return `<div style="margin-top:.35rem"><button class="btn primario pequeno" data-receber="${s.id}">Pedido Recebido</button></div>`;
+        if (st === 'recebido')
+          return `<div style="margin-top:.35rem"><button class="btn primario pequeno" data-fornecer="${s.id}">✓ Fornecido</button></div>`;
+        if (st === 'fornecido')
+          return `<div style="margin-top:.35rem"><button class="btn secundario pequeno" disabled title="Esta solicitação já foi fornecida">✓ Fornecido</button></div>`;
+        return '';
+      };
 
       p.innerHTML = `
       <div class="indicadores">
-        <div class="indicador destaque"><div class="rotulo">Catanhos pendentes</div><div class="valor">${fmtQtd(soma(pend))}</div><div class="small" style="color:var(--azul-200)">${plural(pend.length, 'solicitação', 'solicitações')}</div></div>
-        <div class="indicador"><div class="rotulo">Catanhos atendidos</div><div class="valor">${fmtQtd(soma(atend))}</div><div class="small muted">${plural(atend.length, 'solicitação', 'solicitações')}</div></div>
-        <div class="indicador"><div class="rotulo">Total de catanhos</div><div class="valor">${fmtQtd(soma(todas))}</div><div class="small muted">${plural(todas.length, 'solicitação', 'solicitações')}</div></div>
+        ${indicador('Catanhos pendentes', pend, true)}
+        ${indicador('Pedidos recebidos', rec)}
+        ${indicador('Catanhos fornecidos', forn)}
+        ${indicador('Total de catanhos', todas)}
       </div>
       <section class="card">
         <h2>Solicitações</h2>
+        <p class="muted small" style="margin-top:-.3rem">Fluxo: Pendente → Pedido Recebido → Fornecido. A baixa no estoque ocorre somente no "Fornecido".</p>
         <div class="filtros">
-          ${[['todas', 'Todas'], ['pendentes', 'Pendentes'], ['atendidas', 'Atendidas']].map(([k, t]) =>
+          ${[['todas', 'Todas'], ['pendentes', 'Pendentes'], ['recebidos', 'Pedido Recebido'], ['fornecidos', 'Fornecidos']].map(([k, t]) =>
             `<button data-filtro="${k}" class="${filtroSolicitacoes === k ? 'ativo' : ''}">${t}</button>`).join('')}
         </div>
         <div class="erro" id="erroAtend"></div>
         ${visiveis.length ? `<div class="tabela-wrap"><table>
           <thead><tr><th>Registrada em</th><th>Modalidade</th><th>Evento</th><th>Retirada</th><th class="num">Catanhos</th><th>Itens</th><th>Responsável</th><th>Status</th></tr></thead>
-          <tbody>${visiveis.map(s => {
-            const at = statusDe(s) === 'atendido';
-            return `<tr class="${at ? 'linha-atendida' : 'linha-pendente'}">
+          <tbody>${visiveis.map(s => `<tr class="${classeLinha(s)}">
               <td>${fmtDataHora(s.criadoEm)}</td>
               <td>${esc(modalidade(s.modalidadeId)?.nome ?? '—')}</td>
               <td>${esc(nomeEvento(evento(s.eventoId)))}</td>
@@ -513,35 +541,100 @@
               <td class="num">${fmtQtd(s.quantidade)}</td>
               <td>${listaItensHtml(s)}</td>
               <td>${esc(s.usuarioNome || '—')}</td>
-              <td>${seloStatus(s)}
-                ${at
-                  ? `<div class="atendimento">${fmtDataHora(s.atendidoEm)}<br>por ${esc(s.atendidoPorNome || '—')}</div>`
-                  : `<div style="margin-top:.35rem"><button class="btn primario pequeno" data-atender="${s.id}">✓ Marcar como Atendido</button></div>`}
-              </td>
-            </tr>`;
-          }).join('')}</tbody></table></div>` : '<p class="muted">Nenhuma solicitação neste filtro.</p>'}
+              <td>${seloStatus(s)}${historicoStatus(s)}${acoes(s)}</td>
+            </tr>`).join('')}</tbody></table></div>` : '<p class="muted">Nenhuma solicitação neste filtro.</p>'}
       </section>`;
 
+      const erro = msg => { $('erroAtend').textContent = msg; };
+      const resumoTexto = s =>
+        `Modalidade: ${modalidade(s.modalidadeId)?.nome ?? '—'}\n` +
+        `Evento: ${nomeEvento(evento(s.eventoId))}\n` +
+        `Retirada: ${s.horarioRetirada || '—'}\n` +
+        `Catanhos: ${fmtQtd(s.quantidade)}`;
+
       p.querySelectorAll('[data-filtro]').forEach(b => b.onclick = () => { filtroSolicitacoes = b.dataset.filtro; PAINEIS.solicitacoes(p); });
-      p.querySelectorAll('[data-atender]').forEach(b => b.onclick = () => {
-        const s = dados.solicitacoes.find(x => x.id === b.dataset.atender);
-        const texto = `Confirmar o atendimento desta solicitação?\n\n` +
-          `Modalidade: ${modalidade(s.modalidadeId)?.nome ?? '—'}\n` +
-          `Evento: ${nomeEvento(evento(s.eventoId))}\n` +
-          `Retirada: ${s.horarioRetirada || '—'}\n` +
-          `Catanhos: ${fmtQtd(s.quantidade)}\n\n` +
-          `O estoque já foi baixado na solicitação e não será baixado novamente.`;
-        if (!window.confirm(texto)) return;
+
+      // ---- Pedido Recebido (não altera o estoque) ----
+      p.querySelectorAll('[data-receber]').forEach(b => b.onclick = () => {
+        const s = dados.solicitacoes.find(x => x.id === b.dataset.receber);
+        if (!window.confirm(`Confirmar que este pedido foi recebido e registrado para atendimento?\n\n${resumoTexto(s)}\n\nO estoque não será alterado.`)) return;
         comBotao(b, async () => {
           try {
             await updateDoc(doc(db, 'solicitacoes', s.id), {
-              status: 'atendido',
-              atendidoEm: serverTimestamp(),
-              atendidoPorUid: perfil.uid,
-              atendidoPorNome: perfil.nome
+              status: 'recebido',
+              recebidoEm: serverTimestamp(),
+              recebidoPorUid: perfil.uid,
+              recebidoPorNome: perfil.nome
             });
-            salvo('solicitacoes', 'Solicitação marcada como Atendida.');
-          } catch (err) { $('erroAtend').textContent = msgErro(err); }
+            salvo('solicitacoes', 'Solicitação marcada como Pedido Recebido.');
+          } catch (err) {
+            erro(err.code === 'permission-denied'
+              ? 'Não foi possível marcar como Pedido Recebido: o status desta solicitação já foi alterado. Clique em Atualizar.'
+              : msgErro(err));
+          }
+        });
+      });
+
+      // ---- Fornecido (baixa no estoque, uma única vez) ----
+      p.querySelectorAll('[data-fornecer]').forEach(b => b.onclick = () => {
+        const s = dados.solicitacoes.find(x => x.id === b.dataset.fornecer);
+        const comBaixa = baixaNoFornecimento(s);
+        const listaBaixa = itensDaSolicitacao(s).map(i => `• ${i.nome}: ${qtdUn(i.quantidade, i.unidade)}`).join('\n');
+        const texto = `Confirmar que este catanho foi FORNECIDO ao responsável?\n\n${resumoTexto(s)}\n\n` +
+          (comBaixa
+            ? `Serão descontados do estoque:\n${listaBaixa}\n\nEsta ação não pode ser desfeita.`
+            : 'Esta solicitação é anterior ao novo fluxo: o estoque já foi baixado e não será baixado novamente.');
+        if (!window.confirm(texto)) return;
+
+        comBotao(b, async () => {
+          const solRef = doc(db, 'solicitacoes', s.id);
+          try {
+            // Confere o status atual no servidor (evita baixa duplicada após atualização da página).
+            const atualSnap = await getDoc(solRef);
+            const atual = { id: atualSnap.id, ...atualSnap.data() };
+            if (statusDe(atual) === 'fornecido') return salvo('solicitacoes', 'Esta solicitação já estava marcada como Fornecido. Nenhuma nova baixa foi feita.');
+            if (statusDe(atual) !== 'recebido') return erro('Esta solicitação precisa estar como "Pedido Recebido" antes de ser marcada como Fornecido.');
+
+            const lote = writeBatch(db);
+            lote.update(solRef, {
+              status: 'fornecido',
+              fornecidoEm: serverTimestamp(),
+              fornecidoPorUid: perfil.uid,
+              fornecidoPorNome: perfil.nome
+            });
+            if (baixaNoFornecimento(atual)) {
+              const lista = itensDaSolicitacao(atual);
+              const snaps = await Promise.all(lista.map(i => getDoc(doc(db, 'itens', i.id))));
+              const faltas = [];
+              lista.forEach((i, k) => {
+                const it = snaps[k].exists() ? snaps[k].data() : null;
+                if (!it) faltas.push(`${i.nome}: item não encontrado no cadastro.`);
+                else if (it.saldo < i.quantidade)
+                  faltas.push(`${i.nome}: estoque insuficiente (necessário ${qtdUn(i.quantidade, i.unidade)}; disponível ${qtdUn(Math.max(it.saldo, 0), it.unidade)}).`);
+              });
+              if (faltas.length) return erro('Não foi possível marcar como Fornecido:\n' + faltas.join('\n') + '\nRegistre uma entrada no estoque e tente novamente.');
+              lista.forEach(i => lote.update(doc(db, 'itens', i.id), {
+                saldo: increment(-i.quantidade),
+                saidas: increment(i.quantidade),
+                ultimaBaixa: s.id,
+                ultimaBaixaEm: serverTimestamp()
+              }));
+            }
+            await lote.commit();
+            salvo('solicitacoes', baixaNoFornecimento(atual)
+              ? 'Solicitação marcada como Fornecido e baixa realizada no estoque.'
+              : 'Solicitação marcada como Fornecido.');
+          } catch (err) {
+            // Se a gravação chegou ao servidor e só a resposta se perdeu, não repete.
+            try {
+              const depois = await getDoc(solRef);
+              if (depois.exists() && depois.data().status === 'fornecido')
+                return salvo('solicitacoes', 'Solicitação marcada como Fornecido.');
+            } catch (_) { /* sem acesso ou sem conexão */ }
+            erro(err.code === 'permission-denied'
+              ? 'Não foi possível marcar como Fornecido: o estoque ou o status foi alterado. Clique em Atualizar e tente novamente.'
+              : msgErro(err));
+          }
         });
       });
     },
@@ -559,9 +652,9 @@
           quando: m.criadoEm, itemNome: m.itemNome, tipo: m.tipo === 'inicial' ? 'Estoque inicial' : 'Entrada',
           quantidade: m.quantidade, unidade: item(m.itemId)?.unidade ?? '', origem: m.porNome || '—', saida: false
         })),
-        ...dados.solicitacoes.flatMap(s => itensDaSolicitacao(s).map(i => ({
-          quando: s.criadoEm, itemNome: i.nome, tipo: 'Saída', quantidade: i.quantidade, unidade: i.unidade,
-          origem: `Solicitação · ${modalidade(s.modalidadeId)?.nome ?? '—'}`, saida: true
+        ...dados.solicitacoes.filter(estoqueBaixado).flatMap(s => itensDaSolicitacao(s).map(i => ({
+          quando: dataDaBaixa(s), itemNome: i.nome, tipo: 'Saída', quantidade: i.quantidade, unidade: i.unidade,
+          origem: `Fornecido · ${modalidade(s.modalidadeId)?.nome ?? '—'}${s.fornecidoPorNome ? ' · por ' + s.fornecidoPorNome : ''}`, saida: true
         })))
       ].sort((a, b) => ms(b.quando) - ms(a.quando));
 
