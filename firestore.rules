@@ -30,6 +30,9 @@ service cloud.firestore {
     function ehResponsavel() {
       return temPerfil() && meuPerfil().perfil == 'responsavel';
     }
+    function ehCatanheiro() {
+      return temPerfil() && meuPerfil().perfil == 'catanheiro';
+    }
     function minhaModalidade() {
       return meuPerfil().modalidadeId;
     }
@@ -140,7 +143,7 @@ service cloud.firestore {
     // ================= Estoque =================
     // Baixa no "Fornecido": só saldo/saídas/marcadores, exatamente a quantidade da
     // solicitação, e só no mesmo lote em que a solicitação é marcada como "fornecido"
-    // (fornecidoEm == agora). Essa marcação só é permitida ao Administrador e só uma
+    // (fornecidoEm == agora). Essa marcação só é permitida ao Administrador/Catanheiro e só uma
     // vez (de "recebido" para "fornecido"), então a baixa nunca se repete — nem por
     // atualização da página, nem por clique duplo.
     function baixaPorFornecimento(itemId) {
@@ -195,20 +198,20 @@ service cloud.firestore {
     // Administradores só são criados pelo Console do Firebase.
     match /usuarios/{uid} {
       allow read: if ehAdmin() || (logado() && request.auth.uid == uid);
-      allow create: if ehAdmin() && request.resource.data.perfil == 'responsavel';
+      allow create: if ehAdmin() && request.resource.data.perfil in ['responsavel', 'catanheiro'];
       allow update: if ehAdmin() && request.resource.data.perfil == resource.data.perfil;
       allow delete: if false;
     }
 
     // Modalidades (inclui o limite de catanhos).
     match /modalidades/{id} {
-      allow read: if ehAdmin() || (ehResponsavel() && minhaModalidade() == id);
+      allow read: if ehAdmin() || ehCatanheiro() || (ehResponsavel() && minhaModalidade() == id);
       allow write: if ehAdmin();
     }
 
     // Eventos: cada evento pertence a uma modalidade.
     match /eventos/{id} {
-      allow read: if ehAdmin() || (ehResponsavel() && resource.data.modalidadeId == minhaModalidade());
+      allow read: if ehAdmin() || ehCatanheiro() || (ehResponsavel() && resource.data.modalidadeId == minhaModalidade());
       allow create, update: if ehAdmin() && request.resource.data.modalidadeId is string;
       allow delete: if false;
     }
@@ -219,7 +222,7 @@ service cloud.firestore {
       allow read: if temPerfil();
       allow create: if ehAdmin() && itemNovoValido(request.resource.data);
       // A baixa por fornecimento só é aceita junto com a marcação "Fornecido",
-      // que é exclusiva do Administrador (ver regras de /solicitacoes).
+      // permitida apenas ao Administrador e ao Catanheiro (ver regras de /solicitacoes).
       allow update: if baixaPorFornecimento(itemId)
         || (ehAdmin() && itemAlteradoPeloAdmin(request.resource.data, resource.data));
       allow delete: if false;
@@ -243,15 +246,18 @@ service cloud.firestore {
     match /solicitacoes/{solId} {
       // "resource == null" permite ao responsável verificar se já pediu para um evento
       // (consulta a um documento que ainda não existe; nada é revelado).
-      allow read: if ehAdmin() || (ehResponsavel() && (resource == null || resource.data.modalidadeId == minhaModalidade()));
+      // O Catanheiro vê apenas solicitações autorizadas ("Pedido Recebido") e as já fornecidas.
+      allow read: if ehAdmin()
+        || (ehResponsavel() && (resource == null || resource.data.modalidadeId == minhaModalidade()))
+        || (ehCatanheiro() && resource != null && resource.data.status in ['recebido', 'fornecido']);
       // Uma solicitação por evento: o identificador é "modalidade_evento" e um
       // documento existente nunca pode ser recriado pelo responsável.
       allow create: if logado() && solicitacaoValida(solId, request.resource.data);
-      // Somente o Administrador muda o status, sempre na ordem
-      // pendente -> recebido -> fornecido, e nunca volta atrás.
-      allow update: if ehAdmin()
-        && (marcarRecebido(request.resource.data, resource.data)
-            || marcarFornecido(solId, request.resource.data, resource.data));
+      // Status sempre na ordem pendente -> recebido -> fornecido, sem voltar atrás.
+      // "Pedido Recebido" (autorização): somente o Administrador.
+      // "Fornecido" (com baixa no estoque): Administrador ou Catanheiro.
+      allow update: if (ehAdmin() && marcarRecebido(request.resource.data, resource.data))
+        || ((ehAdmin() || ehCatanheiro()) && marcarFornecido(solId, request.resource.data, resource.data));
       allow delete: if false;
     }
   }
