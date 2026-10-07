@@ -4,6 +4,10 @@ rules_version = '2';
 // Cole este conteúdo em: Console do Firebase > Firestore > aba "Regras" > Publicar.
 //
 // Todas as quantidades (catanhos e estoque) são números inteiros.
+//
+// Fluxo da solicitação:
+//   pendente  ->  recebido ("Pedido Recebido")  ->  fornecido ("Fornecido" + baixa no estoque)
+// A baixa no estoque acontece uma única vez, na passagem de "recebido" para "fornecido".
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -32,43 +36,49 @@ service cloud.firestore {
     function horaValida(h) {
       return h is string && h.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$');
     }
+    function caminhoItem(k) {
+      return /databases/$(database)/documents/itens/$(k);
+    }
+    function caminhoSolicitacao(id) {
+      return /databases/$(database)/documents/solicitacoes/$(id);
+    }
 
-    // ================= Solicitação =================
+    // ================= Criação da solicitação (responsável) =================
     // Uma solicitação só é aceita se:
     // - for da modalidade do responsável e de um evento dessa modalidade;
     // - for a única solicitação da modalidade para o evento (id "modalidade_evento");
     // - tiver horário de retirada e quantidade de catanhos dentro do limite;
-    // - tiver de 1 a 6 itens, todos ativos; o consumo de cada item deve ser
-    //   exatamente a quantidade de catanhos pedida;
-    // - cada item tiver tido a baixa no estoque feita NO MESMO lote,
-    //   sem deixar o saldo negativo (ver regras de /itens).
-    function itemNaPosicao(solId, d, ks, i) {
-      return ks.size() <= i || itemDaSolicitacaoValido(solId, d, ks[i]);
+    // - tiver de 1 a 6 itens, todos ativos e com saldo suficiente no momento do pedido;
+    //   a quantidade de cada item é igual à quantidade de catanhos pedida.
+    // O responsável NÃO altera o estoque: a baixa é feita no "Fornecido".
+    function itemNaPosicao(d, ks, i) {
+      return ks.size() <= i || itemDaSolicitacaoValido(d, ks[i]);
     }
-    function itemDaSolicitacaoValido(solId, d, k) {
+    function itemDaSolicitacaoValido(d, k) {
       let q = d.itens[k].quantidade;
-      let depois = getAfter(/databases/$(database)/documents/itens/$(k)).data;
+      let atual = get(caminhoItem(k)).data;
       return q is int
         && q >= 1
         && d.itens[k].keys().hasOnly(['nome', 'unidade', 'quantidade'])
-        && depois.ativo == true
+        && atual.ativo == true
         && q == d.quantidade
-        && depois.ultimaBaixa == solId
-        && depois.saldo >= 0;
+        && q <= atual.saldo;
     }
     function solicitacaoValida(solId, d) {
       let p = meuPerfil();
       let limite = get(/databases/$(database)/documents/modalidades/$(p.modalidadeId)).data.limite;
       let ev = get(/databases/$(database)/documents/eventos/$(d.eventoId)).data;
       let ks = d.itens.keys();
+      let campos = ['modalidadeId', 'eventoId', 'horarioRetirada', 'quantidade', 'itens', 'usuarioId', 'usuarioNome', 'status', 'baixaNoFornecimento', 'criadoEm'];
       return p.perfil == 'responsavel'
-        && d.keys().hasOnly(['modalidadeId', 'eventoId', 'horarioRetirada', 'quantidade', 'itens', 'usuarioId', 'usuarioNome', 'status', 'criadoEm'])
-        && d.keys().hasAll(['modalidadeId', 'eventoId', 'horarioRetirada', 'quantidade', 'itens', 'usuarioId', 'usuarioNome', 'status', 'criadoEm'])
+        && d.keys().hasOnly(campos)
+        && d.keys().hasAll(campos)
         && d.modalidadeId == p.modalidadeId
         && solId == p.modalidadeId + '_' + d.eventoId
         && d.usuarioId == request.auth.uid
         && d.usuarioNome == p.nome
         && d.status == 'pendente'
+        && d.baixaNoFornecimento == true
         && d.criadoEm == request.time
         && horaValida(d.horarioRetirada)
         && ev.modalidadeId == p.modalidadeId
@@ -79,33 +89,75 @@ service cloud.firestore {
         && d.itens is map
         && ks.size() >= 1
         && ks.size() <= 6
-        && itemNaPosicao(solId, d, ks, 0)
-        && itemNaPosicao(solId, d, ks, 1)
-        && itemNaPosicao(solId, d, ks, 2)
-        && itemNaPosicao(solId, d, ks, 3)
-        && itemNaPosicao(solId, d, ks, 4)
-        && itemNaPosicao(solId, d, ks, 5);
+        && itemNaPosicao(d, ks, 0)
+        && itemNaPosicao(d, ks, 1)
+        && itemNaPosicao(d, ks, 2)
+        && itemNaPosicao(d, ks, 3)
+        && itemNaPosicao(d, ks, 4)
+        && itemNaPosicao(d, ks, 5);
+    }
+
+    // ================= Mudança de status (Administrador) =================
+    function quemFez(n, prefixo) {
+      return n[prefixo + 'Em'] == request.time
+        && n[prefixo + 'PorUid'] == request.auth.uid
+        && n[prefixo + 'PorNome'] == meuPerfil().nome;
+    }
+    // Pendente -> Pedido Recebido (não mexe no estoque).
+    function marcarRecebido(n, a) {
+      return a.get('status', 'pendente') == 'pendente'
+        && n.diff(a).affectedKeys().hasOnly(['status', 'recebidoEm', 'recebidoPorUid', 'recebidoPorNome'])
+        && n.status == 'recebido'
+        && quemFez(n, 'recebido');
+    }
+    // Pedido Recebido -> Fornecido. Para solicitações novas, exige que cada item
+    // tenha recebido a baixa NESTE MESMO lote (ver regras de /itens).
+    function marcarFornecido(solId, n, a) {
+      return a.status == 'recebido'
+        && n.diff(a).affectedKeys().hasOnly(['status', 'fornecidoEm', 'fornecidoPorUid', 'fornecidoPorNome'])
+        && n.status == 'fornecido'
+        && quemFez(n, 'fornecido')
+        && (a.get('baixaNoFornecimento', false) != true || baixasConferidas(solId, a));
+    }
+    function baixasConferidas(solId, a) {
+      let ks = a.itens.keys();
+      return baixaNaPosicao(solId, ks, 0)
+        && baixaNaPosicao(solId, ks, 1)
+        && baixaNaPosicao(solId, ks, 2)
+        && baixaNaPosicao(solId, ks, 3)
+        && baixaNaPosicao(solId, ks, 4)
+        && baixaNaPosicao(solId, ks, 5);
+    }
+    function baixaNaPosicao(solId, ks, i) {
+      return ks.size() <= i || baixaFeitaAgora(solId, ks[i]);
+    }
+    function baixaFeitaAgora(solId, k) {
+      let depois = getAfter(caminhoItem(k)).data;
+      return depois.get('ultimaBaixa', '') == solId
+        && depois.get('ultimaBaixaEm', null) == request.time;
     }
 
     // ================= Estoque =================
-    // Baixa feita pelo responsável: só pode mexer em saldo/saídas, só no
-    // mesmo lote em que a solicitação é criada (criadoEm == agora), e a baixa
-    // tem de ser exatamente a quantidade pedida. Repetir a mesma solicitação
-    // é impossível: o documento já existiria e não pode ser recriado.
-    function baixaPorSolicitacao(itemId) {
+    // Baixa no "Fornecido": só saldo/saídas/marcadores, exatamente a quantidade da
+    // solicitação, e só no mesmo lote em que a solicitação é marcada como "fornecido"
+    // (fornecidoEm == agora). Essa marcação só é permitida ao Administrador e só uma
+    // vez (de "recebido" para "fornecido"), então a baixa nunca se repete — nem por
+    // atualização da página, nem por clique duplo.
+    function baixaPorFornecimento(itemId) {
       let novo = request.resource.data;
       let ant = resource.data;
-      return logado()
-        && novo.diff(ant).affectedKeys().hasOnly(['saldo', 'saidas', 'ultimaBaixa'])
+      return novo.diff(ant).affectedKeys().hasOnly(['saldo', 'saidas', 'ultimaBaixa', 'ultimaBaixaEm'])
+        && novo.get('ultimaBaixaEm', null) == request.time
         && novo.ultimaBaixa is string
-        && novo.ultimaBaixa != ant.ultimaBaixa
-        && confereSolicitacao(itemId, novo, ant);
+        && novo.ultimaBaixa.size() > 0
+        && baixaConfereComSolicitacao(itemId, novo, ant,
+             getAfter(caminhoSolicitacao(novo.ultimaBaixa)).data);
     }
-    function confereSolicitacao(itemId, novo, ant) {
-      let sol = getAfter(/databases/$(database)/documents/solicitacoes/$(novo.ultimaBaixa)).data;
+    function baixaConfereComSolicitacao(itemId, novo, ant, sol) {
       let q = sol.itens[itemId].quantidade;
-      return sol.criadoEm == request.time
-        && sol.usuarioId == request.auth.uid
+      return sol.status == 'fornecido'
+        && sol.fornecidoEm == request.time
+        && sol.get('baixaNoFornecimento', false) == true
         && q is int
         && novo.saldo == ant.saldo - q
         && novo.saidas == ant.saidas + q
@@ -115,7 +167,7 @@ service cloud.firestore {
       return ['nome', 'unidade', 'ativo', 'estoqueInicial', 'entradas', 'saidas', 'saldo', 'ultimaBaixa'];
     }
     function itemBasicoValido(d) {
-      return d.keys().hasOnly(camposItem())
+      return d.keys().hasOnly(camposItem().concat(['ultimaBaixaEm']))
         && d.keys().hasAll(camposItem())
         && d.nome is string && d.nome.size() > 0
         && d.unidade is string && d.unidade.size() > 0
@@ -133,7 +185,8 @@ service cloud.firestore {
       return itemBasicoValido(n)
         && n.entradas >= a.entradas
         && n.saidas == a.saidas
-        && n.ultimaBaixa == a.ultimaBaixa;
+        && n.ultimaBaixa == a.ultimaBaixa
+        && n.get('ultimaBaixaEm', null) == a.get('ultimaBaixaEm', null);
     }
 
     // ================= Coleções =================
@@ -160,18 +213,20 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Itens e estoque. O responsável lê o catálogo, mas só altera o saldo
-    // através de uma solicitação válida.
+    // Itens e estoque. O responsável apenas lê o catálogo; somente o
+    // Administrador altera itens e estoque.
     match /itens/{itemId} {
       allow read: if temPerfil();
       allow create: if ehAdmin() && itemNovoValido(request.resource.data);
-      allow update: if baixaPorSolicitacao(itemId)
+      // A baixa por fornecimento só é aceita junto com a marcação "Fornecido",
+      // que é exclusiva do Administrador (ver regras de /solicitacoes).
+      allow update: if baixaPorFornecimento(itemId)
         || (ehAdmin() && itemAlteradoPeloAdmin(request.resource.data, resource.data));
       allow delete: if false;
     }
 
     // Movimentações de estoque feitas pelo Administrador (estoque inicial e entradas).
-    // As saídas ficam registradas nas próprias solicitações.
+    // As saídas ficam registradas nas próprias solicitações (no "Fornecido").
     match /movimentos/{id} {
       allow read: if ehAdmin();
       allow create: if ehAdmin()
@@ -192,14 +247,11 @@ service cloud.firestore {
       // Uma solicitação por evento: o identificador é "modalidade_evento" e um
       // documento existente nunca pode ser recriado pelo responsável.
       allow create: if logado() && solicitacaoValida(solId, request.resource.data);
-      // Único ajuste permitido: o Administrador marcar como Atendido (sem mexer no estoque).
+      // Somente o Administrador muda o status, sempre na ordem
+      // pendente -> recebido -> fornecido, e nunca volta atrás.
       allow update: if ehAdmin()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'atendidoEm', 'atendidoPorUid', 'atendidoPorNome'])
-        && resource.data.get('status', 'pendente') == 'pendente'
-        && request.resource.data.status == 'atendido'
-        && request.resource.data.atendidoEm == request.time
-        && request.resource.data.atendidoPorUid == request.auth.uid
-        && request.resource.data.atendidoPorNome == meuPerfil().nome;
+        && (marcarRecebido(request.resource.data, resource.data)
+            || marcarFornecido(solId, request.resource.data, resource.data));
       allow delete: if false;
     }
   }
