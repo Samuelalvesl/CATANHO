@@ -111,3 +111,8 @@ label.marcar{display:flex;align-items:center;gap:.5rem;font-weight:600}
 label.marcar input{width:auto;margin:0}
 .itens-sol td input{max-width:110px;margin-left:auto}
 .topo-dir .btn.claro{white-space:nowrap}
+
+/* ===== Status "Pedido Recebido" ===== */
+.status.recebido{background:var(--azul-100);color:var(--azul-800);border:1px solid var(--azul-400)}
+tr.linha-recebida td:first-child{box-shadow:inset 4px 0 0 var(--azul-400)}
+.btn:disabled[title]{cursor:not-allowed}
